@@ -145,32 +145,52 @@ export function createEvent(input: Pick<AdverseEvent, 'studyId' | 'subjectId' | 
 export function updateEventStatus(id: string, status: EventStatus, expectedVersion?: number, actor = 'system') {
   const event = eventFor(id);
   const study = studyFor(event.studyId);
-  if (expectedVersion !== undefined && expectedVersion > event.version) {
-    throw new DomainConflictError('event version is ahead of current state', { eventId: id, expectedVersion, actualVersion: event.version });
+
+  // Strict optimistic concurrency: whenever the caller carries an expectedVersion
+  // it must equal the server's current version exactly. Both stale and ahead
+  // versions are rejected (and, like all validation below, before any write), so
+  // a client can never dictate or rewind the server's version.
+  if (expectedVersion !== undefined && expectedVersion !== event.version) {
+    const ahead = expectedVersion > event.version;
+    throw new DomainConflictError(ahead ? 'event version is ahead of current state' : 'event version is behind current state', { eventId: id, expectedVersion, actualVersion: event.version });
   }
   if (study.status === 'LOCKED' && status !== 'CLOSED') {
     throw new DomainConflictError('locked studies only accept closure', { studyId: study.id, eventId: id });
   }
+
+  // Idempotent replay: a valid repeated submission for the status already in
+  // place is a no-op — no version increment and no duplicate derived records.
   if (event.status === status) return clone(event);
+
+  // Even under a study lock the existing state machine still applies; the only
+  // closure path permitted above still has to be a legal transition.
   const allowed = statusTransitions[event.status] ?? [];
   if (!allowed.includes(status)) {
     throw new DomainConflictError('invalid event status transition', { eventId: id, from: event.status, to: status });
   }
+
+  // All validation passed. Capture the before/after context once and commit the
+  // transition synchronously: exactly one version increment, and every derived
+  // record references the same previous/next status and version.
   const previous = event.status;
-  const requestedVersion = expectedVersion ?? event.version;
+  const previousVersion = event.version;
+  const nextVersion = previousVersion + 1;
+  const timestamp = now();
+
   event.status = status;
-  event.version = requestedVersion + 1;
-  event.lastModifiedAt = now();
+  event.version = nextVersion;
+  event.lastModifiedAt = timestamp;
   event.lastModifiedBy = actor;
+
   appendAudit(event, 'STATUS_CHANGED', actor);
-  appendTimeline(event, 'STATUS_CHANGED', { previous, next: status, actor, expectedVersion: requestedVersion });
-  appendOutbox(event.id, 'ADVERSE_EVENT', 'ADVERSE_EVENT_STATUS_CHANGED', event.version, { eventId: event.id, previous, next: status, version: event.version });
+  appendTimeline(event, 'STATUS_CHANGED', { previous, next: status, actor, expectedVersion: previousVersion, previousVersion, version: nextVersion });
+  appendOutbox(event.id, 'ADVERSE_EVENT', 'ADVERSE_EVENT_STATUS_CHANGED', nextVersion, { eventId: event.id, studyId: event.studyId, previous, next: status, previousVersion, version: nextVersion, actor });
   const task = reviewTasks.find((item) => item.eventId === event.id && item.status !== 'RESOLVED');
   if (task && ['CONFIRMED', 'CLOSED'].includes(status)) {
     task.status = 'RESOLVED';
   }
   if (status === 'REPORTED') {
-    appendTimeline(event, 'REGULATORY_REPORT_READY', { eventId: event.id, version: event.version });
+    appendTimeline(event, 'REGULATORY_REPORT_READY', { eventId: event.id, previous, status, previousVersion, version: nextVersion });
   }
   return clone(event);
 }
