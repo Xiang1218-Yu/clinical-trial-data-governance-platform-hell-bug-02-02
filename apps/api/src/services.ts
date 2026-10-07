@@ -43,16 +43,17 @@ function eventFingerprint(input: { studyId: string; subjectId: string; source?: 
     : [input.studyId, input.subjectId, normalize(input.term), input.onsetDate ?? 'unknown'].join('|');
   return createHash('sha256').update(identity).digest('hex');
 }
-function appendAudit(event: AdverseEvent, action: EventAudit['action'], actor: string) {
-  auditEntries.unshift({ id: `audit-${randomUUID().slice(0, 10)}`, eventId: event.id, studyId: event.studyId, action, version: event.version, snapshot: clone(event), actor, createdAt: now() });
+function appendAudit(event: AdverseEvent, action: EventAudit['action'], actor: string, at = now()) {
+  auditEntries.unshift({ id: `audit-${randomUUID().slice(0, 10)}`, eventId: event.id, studyId: event.studyId, action, version: event.version, snapshot: clone(event), actor, createdAt: at });
 }
-function appendTimeline(event: AdverseEvent, type: string, payload: Record<string, unknown>) {
-  eventTimeline.unshift({ id: `timeline-${randomUUID().slice(0, 10)}`, eventId: event.id, version: event.version, type, payload: clone(payload), createdAt: now() });
+function appendTimeline(event: AdverseEvent, type: string, payload: Record<string, unknown>, at = now()) {
+  eventTimeline.unshift({ id: `timeline-${randomUUID().slice(0, 10)}`, eventId: event.id, version: event.version, type, payload: clone(payload), createdAt: at });
 }
-function appendOutbox(aggregateId: string, aggregateType: OutboxMessage['aggregateType'], eventType: string, version: number, payload: Record<string, unknown>) {
+function appendOutbox(aggregateId: string, aggregateType: OutboxMessage['aggregateType'], eventType: string, version: number, payload: Record<string, unknown>, at = now()) {
   const dedupeKey = `${aggregateType}:${aggregateId}:${eventType}:${version}`;
-  if (outboxMessages.some((message) => message.dedupeKey === dedupeKey)) return outboxMessages.find((message) => message.dedupeKey === dedupeKey);
-  const message: OutboxMessage = { id: `outbox-${randomUUID().slice(0, 10)}`, aggregateId, aggregateType, eventType, version, dedupeKey, payload: clone(payload), status: 'PENDING', createdAt: now() };
+  const existing = outboxMessages.find((message) => message.dedupeKey === dedupeKey);
+  if (existing) return existing;
+  const message: OutboxMessage = { id: `outbox-${randomUUID().slice(0, 10)}`, aggregateId, aggregateType, eventType, version, dedupeKey, payload: clone(payload), status: 'PENDING', createdAt: at };
   outboxMessages.push(message);
   return message;
 }
@@ -135,42 +136,57 @@ export function createEvent(input: Pick<AdverseEvent, 'studyId' | 'subjectId' | 
   const timestamp = input.receivedAt ?? now();
   const event: AdverseEvent = { id: `ae-${randomUUID().slice(0, 8)}`, studyId: input.studyId, subjectId: input.subjectId, term: input.term.trim(), severity: input.severity, status: 'OPEN', onsetDate: input.onsetDate ?? timestamp.slice(0, 10), receivedAt: timestamp, causality: input.causality, seriousness: input.seriousness, source, sourceRecordId: input.sourceRecordId, fingerprint, version: 1, lastModifiedAt: timestamp, lastModifiedBy: input.actor ?? 'system' };
   adverseEvents.unshift(event);
-  appendAudit(event, 'CREATED', input.actor ?? 'system');
-  appendTimeline(event, 'EVENT_CREATED', { source, sourceRecordId: input.sourceRecordId ?? null });
-  appendOutbox(event.id, 'ADVERSE_EVENT', 'ADVERSE_EVENT_CREATED', event.version, { event: clone(event) });
-  if (event.seriousness || event.severity === 'LIFE_THREATENING') reviewTasks.unshift({ id: `review-${randomUUID().slice(0, 8)}`, studyId: event.studyId, eventId: event.id, queue: 'MEDICAL', status: 'UNASSIGNED', priority: event.severity === 'LIFE_THREATENING' ? 100 : 90, dueAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(), createdAt: timestamp });
+  appendAudit(event, 'CREATED', input.actor ?? 'system', timestamp);
+  appendTimeline(event, 'EVENT_CREATED', { source, sourceRecordId: input.sourceRecordId ?? null }, timestamp);
+  appendOutbox(event.id, 'ADVERSE_EVENT', 'ADVERSE_EVENT_CREATED', event.version, { event: clone(event) }, timestamp);
+  if (event.seriousness || event.severity === 'LIFE_THREATENING') reviewTasks.unshift({ id: `review-${randomUUID().slice(0, 8)}`, studyId: event.studyId, eventId: event.id, queue: 'MEDICAL', status: 'UNASSIGNED', priority: event.severity === 'LIFE_THREATENING' ? 100 : 90, dueAt: new Date(Date.parse(timestamp) + 48 * 60 * 60 * 1000).toISOString(), createdAt: timestamp });
   return clone(event);
 }
 
 export function updateEventStatus(id: string, status: EventStatus, expectedVersion?: number, actor = 'system') {
   const event = eventFor(id);
   const study = studyFor(event.studyId);
-  if (expectedVersion !== undefined && expectedVersion > event.version) {
-    throw new DomainConflictError('event version is ahead of current state', { eventId: id, expectedVersion, actualVersion: event.version });
+
+  // 严格乐观并发：expectedVersion 必须与服务端当前版本完全一致，过期与超前一律拒绝。
+  // 新版本只能由服务端当前版本权威递增，绝不采用调用方携带的版本号。
+  if (expectedVersion !== undefined && expectedVersion !== event.version) {
+    throw new DomainConflictError('event version conflict', {
+      eventId: id,
+      expectedVersion,
+      actualVersion: event.version,
+      reason: expectedVersion < event.version ? 'STALE_VERSION' : 'FUTURE_VERSION',
+    });
   }
   if (study.status === 'LOCKED' && status !== 'CLOSED') {
     throw new DomainConflictError('locked studies only accept closure', { studyId: study.id, eventId: id });
   }
+  // 幂等：同状态重复流转直接返回当前快照，不产生版本递增，也不写任何派生记录。
   if (event.status === status) return clone(event);
   const allowed = statusTransitions[event.status] ?? [];
   if (!allowed.includes(status)) {
     throw new DomainConflictError('invalid event status transition', { eventId: id, from: event.status, to: status });
   }
+
+  // 所有校验已通过：先准备派生记录所需的上下文，再做唯一一次状态突变，
+  // 保证 audit 快照、timeline、review task 与 outbox 引用同一前后状态和版本。
   const previous = event.status;
-  const requestedVersion = expectedVersion ?? event.version;
-  event.status = status;
-  event.version = requestedVersion + 1;
-  event.lastModifiedAt = now();
-  event.lastModifiedBy = actor;
-  appendAudit(event, 'STATUS_CHANGED', actor);
-  appendTimeline(event, 'STATUS_CHANGED', { previous, next: status, actor, expectedVersion: requestedVersion });
-  appendOutbox(event.id, 'ADVERSE_EVENT', 'ADVERSE_EVENT_STATUS_CHANGED', event.version, { eventId: event.id, previous, next: status, version: event.version });
+  const fromVersion = event.version;
+  const nextVersion = fromVersion + 1;
+  const committedAt = now();
   const task = reviewTasks.find((item) => item.eventId === event.id && item.status !== 'RESOLVED');
-  if (task && ['CONFIRMED', 'CLOSED'].includes(status)) {
-    task.status = 'RESOLVED';
-  }
+  const resolveTask = Boolean(task && ['CONFIRMED', 'CLOSED'].includes(status));
+
+  event.status = status;
+  event.version = nextVersion;
+  event.lastModifiedAt = committedAt;
+  event.lastModifiedBy = actor;
+
+  if (resolveTask && task) task.status = 'RESOLVED';
+  appendAudit(event, 'STATUS_CHANGED', actor, committedAt);
+  appendTimeline(event, 'STATUS_CHANGED', { previous, next: status, actor, expectedVersion: expectedVersion ?? null, fromVersion, version: nextVersion }, committedAt);
+  appendOutbox(event.id, 'ADVERSE_EVENT', 'ADVERSE_EVENT_STATUS_CHANGED', nextVersion, { eventId: event.id, previous, next: status, version: nextVersion, fromVersion }, committedAt);
   if (status === 'REPORTED') {
-    appendTimeline(event, 'REGULATORY_REPORT_READY', { eventId: event.id, version: event.version });
+    appendTimeline(event, 'REGULATORY_REPORT_READY', { eventId: event.id, version: event.version }, committedAt);
   }
   return clone(event);
 }
